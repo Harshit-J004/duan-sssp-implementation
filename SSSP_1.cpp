@@ -5,12 +5,13 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
-#include <random>
 #include <functional>
 #include <numeric>
 #include <stdexcept>
 #include <limits>
-#include <cstdint>
+#include <set>
+#include <map>
+
 using namespace std;
 
 typedef long long ll;
@@ -22,671 +23,652 @@ struct Edge {
 };
 
 int n, m;
-vector<vector<Edge>> adj;
-vector<ll> dist;
+vector<vector<Edge>> adj, radj;
+vector<ll> db;
 vector<int> pred;
-vector<bool> complete;
-int k, t, lmax;
+int k, t, max_level;
 
-mt19937 rng(123456); 
+bool tie_breaker(int u, int v) {
+    return u < v;
+}
 
-struct DataStructureD {
+class DataStructureD {
+private:
     struct Block {
-        ll min_dist, max_dist;
-        vector<int> vertices;
-        ll range_bound; 
+        vector<pair<int, ll>> elements;
+        ll separator_lower;
+        ll separator_upper;
         
-        Block(ll B, int k_param) {
-            min_dist = INF;
-            max_dist = -INF;
-            range_bound = max(1LL, B / max(1LL, (1LL * k_param * k_param)));
+        Block(ll lower = INF, ll upper = -INF) : separator_lower(lower), separator_upper(upper) {}
+        
+        bool empty() const { return elements.empty(); }
+        size_t size() const { return elements.size(); }
+        
+        void add(int vertex, ll dist) {
+            elements.push_back({vertex, dist});
         }
         
-        void add_vertex(int v, ll d) {
-            if (vertices.empty()) {
-                min_dist = max_dist = d;
-            } else {
-                min_dist = min(min_dist, d);
-                max_dist = max(max_dist, d);
+        ll min_value() const { 
+            if (empty()) return INF;
+            ll min_val = INF;
+            for (const auto& [v, d] : elements) {
+                min_val = min(min_val, d);
             }
-            vertices.push_back(v);
+            return min_val;
         }
         
-        bool can_fit(ll new_dist) const {
-            if (vertices.empty()) return true;
-            ll new_min = min(min_dist, new_dist);
-            ll new_max = max(max_dist, new_dist);
-            return (new_max - new_min) <= range_bound;
+        ll max_value() const { 
+            if (empty()) return -INF;
+            ll max_val = -INF;
+            for (const auto& [v, d] : elements) {
+                max_val = max(max_val, d);
+            }
+            return max_val;
         }
         
-        bool is_full(int capacity) const {
-            return (int)vertices.size() >= capacity;
+        void update_bounds() {
+            if (empty()) {
+                separator_lower = INF;
+                separator_upper = -INF;
+            } else {
+                separator_lower = min_value();
+                separator_upper = max_value();
+            }
         }
     };
     
-    vector<Block> small_blocks; 
-    vector<pair<ll, Block>> large_blocks; 
-    
-    unordered_map<int, pair<ll, int>> vertex_info; 
-    unordered_set<int> all_vertices; 
-    
-    uint64_t capacity;
-    ll bound;
-    int k_param;
-    int block_size;
-    
-    DataStructureD(ll B, uint64_t M, int k) : bound(B), capacity(M), k_param(k) {
-        block_size = max(1, (int)sqrt(M));
-        small_blocks.reserve(block_size * 2);
-        large_blocks.reserve(block_size);
-    }
-    
-    bool empty() const {
-        return small_blocks.empty() && large_blocks.empty();
+    vector<Block> d0_sequence;
+    vector<Block> d1_sequence;
+    unordered_map<int, pair<ll, pair<int, int>>> vertex_index;
+    int M;
+    ll B;
+
+public:
+    void initialize(int capacity, ll bound) {
+        M = capacity;
+        B = bound;
+        d0_sequence.clear();
+        d1_sequence.clear();
+        vertex_index.clear();
+        
+        d1_sequence.emplace_back(-INF, B);
     }
     
     void insert(int vertex, ll distance) {
-        if (distance >= bound) return;
+        if (distance >= B) return;
         
-        if (all_vertices.count(vertex)) {
-            auto existing = vertex_info[vertex];
-            if (distance >= existing.first) return;
+        if (vertex_index.count(vertex)) {
+            auto [old_dist, loc] = vertex_index[vertex];
+            if (distance >= old_dist) return;
             remove_vertex(vertex);
         }
         
-        bool inserted = false;
-        for (int i = 0; i < (int)small_blocks.size(); i++) {
-            auto& block = small_blocks[i];
-            if (!block.is_full(block_size) && block.can_fit(distance)) {
-                block.add_vertex(vertex, distance);
-                vertex_info[vertex] = {distance, i};
-                all_vertices.insert(vertex);
-                inserted = true;
-                break;
-            }
+        int target_block = find_d1_block(distance);
+        
+        while (target_block >= (int)d1_sequence.size()) {
+            d1_sequence.emplace_back(B, B);
         }
         
-        if (!inserted) {
-            Block new_block(bound, k_param);
-            new_block.add_vertex(vertex, distance);
-            small_blocks.push_back(new_block);
-            vertex_info[vertex] = {distance, (int)small_blocks.size() - 1};
-            all_vertices.insert(vertex);
-        }
+        d1_sequence[target_block].add(vertex, distance);
+        vertex_index[vertex] = {distance, {1, target_block}};
         
-        promote_full_blocks();
+        if ((int)d1_sequence[target_block].size() > M) {
+            split_d1_block(target_block);
+        }
     }
     
-    void batch_prepend(vector<pair<int, ll>>& pairs) {
-        if (pairs.empty()) return;
-
-        sort(pairs.begin(), pairs.end(), 
-             [](const pair<int,ll>& a, const pair<int,ll>& b) { 
-                 return a.second < b.second; 
-             });
+    void batch_prepend(const vector<pair<int, ll>>& elements) {
+        if (elements.empty()) return;
         
-        vector<pair<int, ll>> clean_pairs;
-        for (const auto& [vertex, distance] : pairs) {
-            if (distance < bound && !all_vertices.count(vertex)) {
-                clean_pairs.push_back({vertex, distance});
-                all_vertices.insert(vertex);
+        ll d1_min = B;
+        for (const auto& block : d1_sequence) {
+            if (!block.empty()) {
+                d1_min = min(d1_min, block.min_value());
             }
         }
         
-        vector<Block> new_blocks;
-        for (int start = clean_pairs.size() - 1; start >= 0; ) {
-            Block block(bound, k_param);
-            int end = max(0, start - block_size + 1);
-            
-            for (int i = start; i >= end; i--) {
-                block.add_vertex(clean_pairs[i].first, clean_pairs[i].second);
-            }
-            
-            new_blocks.push_back(block);
-            start = end - 1;
-        }
-        
-        small_blocks.insert(small_blocks.begin(), new_blocks.begin(), new_blocks.end());
-        reindex_blocks();
-        promote_full_blocks();
-    }
-    
-    pair<vector<int>, ll> pull() {
-        vector<int> result;
-        uint64_t count = 0;
-        
-        while (!small_blocks.empty() && count < capacity) {
-            auto& block = small_blocks.front();
-            
-            while (!block.vertices.empty() && count < capacity) {
-                int vertex = block.vertices.back();
-                block.vertices.pop_back();
-                vertex_info.erase(vertex);
-                all_vertices.erase(vertex);
-                result.push_back(vertex);
-                count++;
-            }
-            
-            if (block.vertices.empty()) {
-                small_blocks.erase(small_blocks.begin());
-                reindex_blocks();
+        vector<pair<int, ll>> filtered;
+        for (const auto& [vertex, distance] : elements) {
+            if (distance < B && distance < d1_min && 
+                (!vertex_index.count(vertex) || vertex_index[vertex].first > distance)) {
+                if (vertex_index.count(vertex)) {
+                    remove_vertex(vertex);
+                }
+                filtered.push_back({vertex, distance});
             }
         }
         
-        while (!large_blocks.empty() && count < capacity) {
-            auto& [min_dist, block] = large_blocks.front();
-            
-            while (!block.vertices.empty() && count < capacity) {
-                int vertex = block.vertices.back();
-                block.vertices.pop_back();
-                vertex_info.erase(vertex);
-                all_vertices.erase(vertex);
-                result.push_back(vertex);
-                count++;
-            }
-            
-            if (block.vertices.empty()) {
-                large_blocks.erase(large_blocks.begin());
-            }
-        }
+        if (filtered.empty()) return;
         
-        ll separator = bound;
-        if (!small_blocks.empty()) {
-            separator = small_blocks.front().min_dist;
-        } else if (!large_blocks.empty()) {
-            separator = large_blocks.front().second.min_dist;
-        }
-        
-        return {result, separator};
-    }
-    
-private:
-    void promote_full_blocks() {
-        auto it = small_blocks.begin();
-        while (it != small_blocks.end()) {
-            if (it->is_full(block_size)) {
-                large_blocks.push_back({it->min_dist, move(*it)});
-                it = small_blocks.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        
-        sort(large_blocks.begin(), large_blocks.end(),
-             [](const pair<ll, Block>& a, const pair<ll, Block>& b) {
+        sort(filtered.begin(), filtered.end(),
+             [](const pair<int, ll>& a, const pair<int, ll>& b) {
+                 if (a.second != b.second) return a.second < b.second;
                  return a.first < b.first;
              });
-        reindex_blocks();
+        
+        vector<Block> new_blocks;
+        int L = filtered.size();
+        int block_size = max(1, M/2);
+        
+        for (int start = 0; start < L; start += block_size) {
+            int end = min(L, start + block_size);
+            Block block;
+            
+            for (int i = start; i < end; i++) {
+                block.add(filtered[i].first, filtered[i].second);
+            }
+            block.update_bounds();
+            new_blocks.push_back(block);
+        }
+        
+        int offset = new_blocks.size();
+        for (auto& [vertex, data] : vertex_index) {
+            if (data.second.first == 0) {
+                data.second.second += offset;
+            }
+        }
+        
+        for (int i = 0; i < (int)new_blocks.size(); i++) {
+            for (const auto& [vertex, distance] : new_blocks[i].elements) {
+                vertex_index[vertex] = {distance, {0, i}};
+            }
+        }
+        
+        d0_sequence.insert(d0_sequence.begin(), new_blocks.begin(), new_blocks.end());
     }
     
-    void reindex_blocks() {
-        for (int i = 0; i < (int)small_blocks.size(); i++) {
-            for (int vertex : small_blocks[i].vertices) {
-                if (vertex_info.count(vertex)) {
-                    vertex_info[vertex].second = i;
+    pair<ll, vector<int>> pull() {
+        vector<pair<int, ll>> candidates;
+        
+        for (const auto& block : d0_sequence) {
+            for (const auto& elem : block.elements) {
+                candidates.push_back(elem);
+                if ((int)candidates.size() >= M) break;
+            }
+            if ((int)candidates.size() >= M) break;
+        }
+        
+        if ((int)candidates.size() < M) {
+            for (const auto& block : d1_sequence) {
+                for (const auto& elem : block.elements) {
+                    candidates.push_back(elem);
+                    if ((int)candidates.size() >= M) break;
+                }
+                if ((int)candidates.size() >= M) break;
+            }
+        }
+        
+        sort(candidates.begin(), candidates.end(),
+             [](const pair<int, ll>& a, const pair<int, ll>& b) {
+                 if (a.second != b.second) return a.second < b.second;
+                 return a.first < b.first;
+             });
+        
+        int extract_count = min(M, (int)candidates.size());
+        
+        vector<int> result;
+        for (int i = 0; i < extract_count; i++) {
+            result.push_back(candidates[i].first);
+            remove_vertex(candidates[i].first);
+        }
+        
+        ll separator = B;
+        if (extract_count < (int)candidates.size()) {
+            separator = candidates[extract_count].second;
+        } else {
+            for (const auto& block : d0_sequence) {
+                if (!block.empty()) {
+                    separator = min(separator, block.min_value());
                 }
             }
+            for (const auto& block : d1_sequence) {
+                if (!block.empty()) {
+                    separator = min(separator, block.min_value());
+                }
+            }
+        }
+        
+        cleanup_structure();
+        return {separator, result};
+    }
+    
+    bool is_empty() const {
+        for (const auto& block : d0_sequence) {
+            if (!block.empty()) return false;
+        }
+        for (const auto& block : d1_sequence) {
+            if (!block.empty()) return false;
+        }
+        return true;
+    }
+
+private:
+    int find_d1_block(ll distance) {
+        for (int i = 0; i < (int)d1_sequence.size(); i++) {
+            if (distance <= d1_sequence[i].separator_upper || 
+                (i == (int)d1_sequence.size() - 1 && distance < B)) {
+                return i;
+            }
+        }
+        return max(0, (int)d1_sequence.size() - 1);
+    }
+    
+    void split_d1_block(int block_idx) {
+        if (block_idx >= (int)d1_sequence.size()) return;
+        
+        auto& block = d1_sequence[block_idx];
+        if ((int)block.size() <= M) return;
+        
+        vector<pair<int, ll>> elements = block.elements;
+        sort(elements.begin(), elements.end(),
+             [](const pair<int, ll>& a, const pair<int, ll>& b) {
+                 if (a.second != b.second) return a.second < b.second;
+                 return a.first < b.first;
+             });
+        
+        int split_idx = elements.size() / 2;
+        ll split_value = elements[split_idx].second;
+        
+        Block left_block(block.separator_lower, split_value);
+        Block right_block(split_value, block.separator_upper);
+        
+        for (int i = 0; i < split_idx; i++) {
+            left_block.add(elements[i].first, elements[i].second);
+        }
+        for (int i = split_idx; i < (int)elements.size(); i++) {
+            right_block.add(elements[i].first, elements[i].second);
+        }
+        
+        left_block.update_bounds();
+        right_block.update_bounds();
+        
+        d1_sequence[block_idx] = left_block;
+        d1_sequence.insert(d1_sequence.begin() + block_idx + 1, right_block);
+        
+        for (auto& [vertex, data] : vertex_index) {
+            if (data.second.first == 1 && data.second.second > block_idx) {
+                data.second.second++;
+            }
+        }
+        
+        if ((int)d1_sequence[block_idx + 1].size() > M) {
+            split_d1_block(block_idx + 1);
         }
     }
     
     void remove_vertex(int vertex) {
-        if (!all_vertices.count(vertex)) return;
+        if (!vertex_index.count(vertex)) return;
         
-        auto [distance, block_idx] = vertex_info[vertex];
+        auto [dist, loc] = vertex_index[vertex];
+        int seq = loc.first;
+        int block_idx = loc.second;
         
-        if (block_idx >= 0 && block_idx < (int)small_blocks.size()) {
-            auto& vertices = small_blocks[block_idx].vertices;
-            auto pos = find(vertices.begin(), vertices.end(), vertex);
-            if (pos != vertices.end()) {
-                swap(*pos, vertices.back());
-                vertices.pop_back();
-            }
-        } else {
-            for (auto& [min_dist, block] : large_blocks) {
-                auto& vertices = block.vertices;
-                auto pos = find(vertices.begin(), vertices.end(), vertex);
-                if (pos != vertices.end()) {
-                    swap(*pos, vertices.back());
-                    vertices.pop_back();
-                    break;
-                }
-            }
+        if (seq == 0 && block_idx < (int)d0_sequence.size()) {
+            remove_from_block(d0_sequence[block_idx], vertex);
+        } else if (seq == 1 && block_idx < (int)d1_sequence.size()) {
+            remove_from_block(d1_sequence[block_idx], vertex);
         }
         
-        vertex_info.erase(vertex);
-        all_vertices.erase(vertex);
+        vertex_index.erase(vertex);
+    }
+    
+    void remove_from_block(Block& block, int vertex) {
+        block.elements.erase(
+            remove_if(block.elements.begin(), block.elements.end(),
+                      [vertex](const pair<int, ll>& p) { return p.first == vertex; }),
+            block.elements.end());
+        block.update_bounds();
+    }
+    
+    void cleanup_structure() {
+        d0_sequence.erase(
+            remove_if(d0_sequence.begin(), d0_sequence.end(),
+                      [](const Block& b) { return b.empty(); }),
+            d0_sequence.end());
+        
+        d1_sequence.erase(
+            remove_if(d1_sequence.begin(), d1_sequence.end(),
+                      [](const Block& b) { return b.empty(); }),
+            d1_sequence.end());
+        
+        for (auto& block : d0_sequence) {
+            if ((int)block.size() > M) {
+                split_d0_block(&block - &d0_sequence[0]);
+            }
+        }
+        for (auto& block : d1_sequence) {
+            if ((int)block.size() > M) {
+                split_d1_block(&block - &d1_sequence[0]);
+            }
+        }
+    }
+    
+    void split_d0_block(int block_idx) {
+        if (block_idx >= (int)d0_sequence.size()) return;
+        
+        auto& block = d0_sequence[block_idx];
+        if ((int)block.size() <= M) return;
+        
+        vector<pair<int, ll>> elements = block.elements;
+        sort(elements.begin(), elements.end(),
+             [](const pair<int, ll>& a, const pair<int, ll>& b) {
+                 if (a.second != b.second) return a.second < b.second;
+                 return a.first < b.first;
+             });
+        
+        int split_idx = elements.size() / 2;
+        ll split_value = elements[split_idx].second;
+        
+        Block left_block(block.separator_lower, split_value);
+        Block right_block(split_value, block.separator_upper);
+        
+        for (int i = 0; i < split_idx; i++) {
+            left_block.add(elements[i].first, elements[i].second);
+        }
+        for (int i = split_idx; i < (int)elements.size(); i++) {
+            right_block.add(elements[i].first, elements[i].second);
+        }
+        
+        left_block.update_bounds();
+        right_block.update_bounds();
+        
+        d0_sequence[block_idx] = left_block;
+        d0_sequence.insert(d0_sequence.begin() + block_idx + 1, right_block);
+        
+        for (auto& [vertex, data] : vertex_index) {
+            if (data.second.first == 0 && data.second.second > block_idx) {
+                data.second.second++;
+            }
+        }
     }
 };
 
-struct DegreeTransform {
-    int original_n;
-    vector<vector<Edge>> new_adj;
-    int new_n;
+void exact_degree_reduction() {
+    vector<vector<Edge>> original_adj = adj;
+    int original_n = n;
     
-    DegreeTransform(int n, const vector<vector<Edge>>& adj) : original_n(n) {
-        transform(adj);
+    radj.resize(n + 1);
+    for (int u = 1; u <= n; u++) {
+        for (const Edge& e : adj[u]) {
+            radj[e.to].push_back({u, e.weight});
+        }
     }
     
-private:
-    void transform(const vector<vector<Edge>>& adj) {
-        new_n = original_n;
+    int vertex_counter = n + 1;
+    int max_nodes = original_n + 6 * m;
+    
+    adj.clear();
+    radj.clear();
+    adj.resize(max_nodes + 1);
+    radj.resize(max_nodes + 1);
+    
+    for (int v = 1; v <= original_n; v++) {
+        const auto& out_edges = original_adj[v];
+        const auto& in_edges = radj[v];
         
-        int total_edges = 0;
-        for (int u = 1; u <= original_n; u++) {
-            total_edges += adj[u].size();
-        }
-        
-        new_adj.resize(original_n + 2 * total_edges + 5);
-        
-        for (int u = 1; u <= original_n; u++) {
-            const auto& edges = adj[u];
-            
-            if (edges.size() <= 2) {
-                new_adj[u] = edges;
-            } else {
-                vector<int> cycle;
-                for (size_t i = 0; i < edges.size(); i++) {
-                    cycle.push_back(++new_n);
-                }
-                
-                for (size_t i = 0; i < cycle.size(); i++) {
-                    int curr = cycle[i];
-                    int next = cycle[(i + 1) % cycle.size()];
-                    new_adj[curr].push_back({next, 0});
-                }
-                
-                for (size_t i = 0; i < edges.size(); i++) {
-                    new_adj[cycle[i]].push_back(edges[i]);
-                }
-                
-                new_adj[u].clear();
-                new_adj[u].push_back({cycle[0], 0});
+        if (out_edges.size() + in_edges.size() <= 2) {
+            adj[v] = out_edges;
+            for (const Edge& e : in_edges) {
+                radj[v].push_back(e);
             }
+            continue;
         }
         
-        new_adj.resize(new_n + 1);
+        vector<int> cycle_nodes;
+        int total_degree = out_edges.size() + in_edges.size();
+        
+        for (int i = 0; i < total_degree; i++) {
+            cycle_nodes.push_back(vertex_counter++);
+        }
+        
+        for (int i = 0; i < total_degree; i++) {
+            int next = (i + 1) % total_degree;
+            adj[cycle_nodes[i]].push_back({cycle_nodes[next], 0});
+            radj[cycle_nodes[next]].push_back({cycle_nodes[i], 0});
+        }
+        
+        adj[v].push_back({cycle_nodes[0], 0});
+        radj[cycle_nodes[0]].push_back({v, 0});
+        
+        int idx = 1;
+        for (const Edge& e : out_edges) {
+            adj[cycle_nodes[idx]].push_back({e.to, e.weight});
+            idx++;
+        }
+        
+        for (const Edge& e : in_edges) {
+            radj[cycle_nodes[idx]].push_back({e.to, e.weight});
+            idx++;
+        }
     }
-};
-
-void init_params(int graph_size) {
-    double log_n = max(1.0, log2(graph_size));
-    k = max(1, (int)floor(pow(log_n, 1.0/3.0)));
-    t = max(1, (int)floor(pow(log_n, 2.0/3.0)));
-    lmax = max(1, min(15, (int)ceil(log_n / t))); 
+    
+    n = vertex_counter - 1;
+    adj.resize(n + 1);
+    radj.resize(n + 1);
 }
 
-pair<vector<int>, vector<int>> find_separators(ll B, const vector<int>& sources) {
-    vector<ll> temp_dist = dist;
-    unordered_set<int> reachable(sources.begin(), sources.end());
-    queue<int> q;
-    
-    for (int s : sources) {
-        q.push(s);
+bool relax_paper_exact(int u, int v, ll weight) {
+    ll candidate = db[u] + weight;
+    if (candidate < db[v]) {
+        db[v] = candidate;
+        pred[v] = u;
+        return true;
+    } else if (candidate == db[v] && pred[v] != -1 && tie_breaker(u, pred[v])) {
+        pred[v] = u;
+        return false;
     }
+    return false;
+}
+
+pair<vector<int>, vector<int>> find_pivots_paper_spec(ll B, const vector<int>& S) {
+    vector<int> W = S;
+    unordered_set<int> W_set(S.begin(), S.end());
+    vector<int> frontier = S;
     
-    while (!q.empty()) {
-        int u = q.front();
-        q.pop();
+    for (int step = 1; step <= k && (int)W.size() <= k * (int)S.size(); step++) {
+        vector<int> next_frontier;
         
-        vector<int> edge_order(adj[u].size());
-        iota(edge_order.begin(), edge_order.end(), 0);
-        shuffle(edge_order.begin(), edge_order.end(), rng);
-        
-        for (int idx : edge_order) {
-            const Edge& e = adj[u][idx];
-            int v = e.to;
-            ll new_dist = temp_dist[u] + e.weight;
-            
-            if (new_dist < B && new_dist < temp_dist[v]) {
-                temp_dist[v] = new_dist;
+        for (int u : frontier) {
+            for (const Edge& e : adj[u]) {
+                int v = e.to;
+                ll new_dist = db[u] + e.weight;
                 
-                if (reachable.find(v) == reachable.end()) {
-                    reachable.insert(v);
-                    q.push(v);
+                if (new_dist < B && new_dist <= db[v]) {
+                    bool relaxed = relax_paper_exact(u, v, e.weight);
                     
-                    if (reachable.size() > 8ULL * k * sources.size()) {
-                        goto done;
+                    if ((relaxed || new_dist == db[v]) && !W_set.count(v)) {
+                        W.push_back(v);
+                        next_frontier.push_back(v);
+                        W_set.insert(v);
                     }
                 }
             }
         }
+        
+        frontier = next_frontier;
+        if (frontier.empty()) break;
     }
     
-    done:
-    if (reachable.size() > 8ULL * k * sources.size()) {
-        return {sources, vector<int>(reachable.begin(), reachable.end())};
-    }
-    
-    vector<int> reachable_vec(reachable.begin(), reachable.end());
-    unordered_map<int, int> parent;
     unordered_map<int, vector<int>> children;
+    unordered_set<int> has_parent;
     
-    for (int u : reachable_vec) {
+    for (int u : W) {
         for (const Edge& e : adj[u]) {
             int v = e.to;
-            if (reachable.count(v) && temp_dist[u] + e.weight == temp_dist[v]) {
-                if (parent.find(v) == parent.end() || 
-                    temp_dist[u] < temp_dist[parent[v]]) {
-                    parent[v] = u;
-                }
+            if (W_set.count(v) && db[v] == db[u] + e.weight && pred[v] == u) {
+                children[u].push_back(v);
+                has_parent.insert(v);
             }
         }
     }
     
-    for (const auto& [child, par] : parent) {
-        children[par].push_back(child);
-    }
-    
-    function<int(int)> get_subtree_size = [&](int u) -> int {
+    function<int(int)> compute_size = [&](int root) -> int {
         int size = 1;
-        for (int child : children[u]) {
-            size += get_subtree_size(child);
+        for (int child : children[root]) {
+            size += compute_size(child);
         }
         return size;
     };
     
-    vector<int> separators;
-    double c = 2.0;
-    double log_k = max(1.0, log2(k));
-    
-    for (int attempt = 0; attempt < 3 && separators.empty(); attempt++) {
-        for (int s : sources) {
-            if (reachable.count(s) && parent.find(s) == parent.end()) {
-                int size = get_subtree_size(s);
-                
-                if (size >= k) {
-                    double log_size = max(1.0, log2(size));
-                    double prob = min(1.0, c * log_size / log_k * (1.0 + 0.1 * attempt));
-                    
-                    uniform_real_distribution<double> coin(0.0, 1.0);
-                    if (coin(rng) < prob) {
-                        separators.push_back(s);
-                    }
-                }
-            }
+    vector<int> P;
+    for (int s : S) {
+        if (W_set.count(s) && !has_parent.count(s) && compute_size(s) >= k) {
+            P.push_back(s);
         }
     }
     
-    if (separators.empty()) {
-        for (int s : sources) {
-            if (reachable.count(s) && parent.find(s) == parent.end()) {
-                if (get_subtree_size(s) >= k) {
-                    separators.push_back(s);
-                    break;
-                }
-            }
-        }
-    }
-    
-    return {separators, reachable_vec};
+    return {P, W};
 }
 
-pair<ll, vector<int>> base_case(ll B, const vector<int>& sources) {
-    if (sources.size() != 1) {
-        throw runtime_error("Base case needs exactly one source");
+pair<ll, vector<int>> base_case_paper_spec(ll B, const vector<int>& S) {
+    if (S.empty()) {
+        return {B, {}};
     }
     
-    int source = sources[0];
     vector<int> result;
-    
     priority_queue<pair<ll, int>, vector<pair<ll, int>>, greater<pair<ll, int>>> pq;
     vector<bool> processed(n + 1, false);
     
-    pq.push({dist[source], source});
+    for (int source : S) {
+        if (db[source] < B) {
+            pq.push({db[source], source});
+        }
+    }
     
     while (!pq.empty() && (int)result.size() < k) {
         auto [d, u] = pq.top();
         pq.pop();
         
-        if (processed[u] || d > dist[u] || d >= B) continue;
-        
+        if (processed[u] || d > db[u] || d >= B) continue;
         processed[u] = true;
+        
         result.push_back(u);
-        complete[u] = true;
         
         for (const Edge& e : adj[u]) {
             int v = e.to;
             ll new_dist = d + e.weight;
             
-            if (new_dist < dist[v] && new_dist < B) {
-                dist[v] = new_dist;
-                pred[v] = u;
-                
-                if (!processed[v]) {
-                    pq.push({new_dist, v});
+            if (new_dist < B && !processed[v]) {
+                if (relax_paper_exact(u, v, e.weight)) {
+                    pq.push({db[v], v});
                 }
             }
         }
     }
     
-    if ((int)result.size() >= k) {
-        ll kth_dist = dist[result[k-1]];
-        while ((int)result.size() > k && dist[result.back()] > kth_dist) {
-            result.pop_back();
-        }
-        return {kth_dist, result};
-    }
-    
-    return {B, result};
+    ll boundary = ((int)result.size() == k && !result.empty()) ? db[result[k-1]] : B;
+    return {boundary, result};
 }
 
-pair<ll, vector<int>> solve_recursive(int level, ll B, const vector<int>& sources) {
-    if (sources.empty()) return {B, {}};
+pair<ll, vector<int>> bounded_mssp_paper_spec(int level, ll B, const vector<int>& S) {
+    if (S.empty()) return {B, {}};
+    if (level == 0) return base_case_paper_spec(B, S);
     
-    if (level == 0) {
-        return base_case(B, sources);
+    auto [P, W] = find_pivots_paper_spec(B, S);
+    
+    DataStructureD D;
+    
+    long long target_ll = k;
+    int safe_exp = min(level * t, min(60, (int)log2(n) + 5));
+    for (int i = 0; i < safe_exp && target_ll <= (1LL << 30); i++) {
+        target_ll *= 2;
+    }
+    int target_size = (int)min(target_ll, (long long)n);
+    
+    D.initialize(max(1, target_size), B);
+    
+    for (int p : P) {
+        D.insert(p, db[p]);
     }
     
-    auto [separators, reachable] = find_separators(B, sources);
-    
-    uint64_t capacity = 1;
-    int exp = (level - 1) * t;
-    if (exp <= 60) {
-        capacity = 1ULL << exp;
-    } else {
-        capacity = UINT64_MAX / 64;
-    }
-    
-    DataStructureD data_structure(B, capacity, k);
-    
-    for (int sep : separators) {
-        data_structure.insert(sep, dist[sep]);
-    }
-    
-    vector<int> all_results;
-    unordered_set<int> result_set;
-    ll final_bound = B;
-    
-    while (!data_structure.empty()) {
-        auto [current_sources, bound_i] = data_structure.pull();
-        
-        if (current_sources.empty()) continue;
-        
-        auto [bound_i_prime, partial_results] = solve_recursive(level - 1, bound_i, current_sources);
-        
-        for (int u : partial_results) {
-            if (result_set.find(u) == result_set.end()) {
-                all_results.push_back(u);
-                result_set.insert(u);
-            }
+    ll B_prime = B;
+    if (!P.empty()) {
+        B_prime = INF;
+        for (int p : P) {
+            B_prime = min(B_prime, db[p]);
         }
+    }
+    
+    vector<int> U;
+    ll current_bound = B_prime;
+    
+    while ((int)U.size() < target_size && !D.is_empty()) {
+        auto [Bi, Si] = D.pull();
+        if (Si.empty()) break;
         
-        final_bound = min(final_bound, bound_i_prime);
+        auto [Bi_prime, Ui] = bounded_mssp_paper_spec(level - 1, Bi, Si);
         
-        vector<pair<int, ll>> batch_items;
-        unordered_set<int> batch_set;
+        for (int u : Ui) {
+            U.push_back(u);
+        }
+        current_bound = Bi_prime;
         
-        for (int u : partial_results) {
+        vector<pair<int, ll>> insert_list, batch_list;
+        unordered_set<int> processed_vertices;
+        
+        for (int u : Ui) {
             for (const Edge& e : adj[u]) {
                 int v = e.to;
-                ll new_dist = dist[u] + e.weight;
+                ll new_dist = db[u] + e.weight;
                 
-                if (new_dist < dist[v] || (new_dist == dist[v] && u < pred[v])) {
-                    dist[v] = new_dist;
-                    pred[v] = u;
-                }
-                
-                if (new_dist < B && batch_set.find(v) == batch_set.end()) {
-                    if (new_dist > bound_i_prime) {
-                        data_structure.insert(v, new_dist);
-                    } else if (new_dist <= bound_i) {
-                        batch_items.push_back({v, new_dist});
-                        batch_set.insert(v);
+                if (new_dist < B && new_dist <= db[v] && !processed_vertices.count(v)) {
+                    ll old_dist = db[v];
+                    bool relaxed = relax_paper_exact(u, v, e.weight);
+                    
+                    if (relaxed || new_dist == old_dist) {
+                        processed_vertices.insert(v);
+                        ll curr_dist = db[v];
+                        
+                        if (curr_dist >= Bi && curr_dist < B) {
+                            insert_list.push_back({v, curr_dist});
+                        } else if (curr_dist >= Bi_prime && curr_dist < Bi) {
+                            batch_list.push_back({v, curr_dist});
+                        }
                     }
                 }
             }
         }
         
-        if (!batch_items.empty()) {
-            data_structure.batch_prepend(batch_items);
+        for (const auto& [v, d] : insert_list) {
+            D.insert(v, d);
+        }
+        if (!batch_list.empty()) {
+            D.batch_prepend(batch_list);
+        }
+        
+        if ((int)U.size() >= target_size) break;
+    }
+    
+    for (int w : W) {
+        if (db[w] < current_bound && find(U.begin(), U.end(), w) == U.end()) {
+            U.push_back(w);
         }
     }
     
-    for (int w : reachable) {
-        if (dist[w] < final_bound && result_set.find(w) == result_set.end()) {
-            all_results.push_back(w);
-            result_set.insert(w);
-            complete[w] = true;
-        }
-    }
-    
-    return {final_bound, all_results};
+    return {min(current_bound, B), U};
 }
 
-struct RadixHeap {
-    static const int BUCKET_COUNT = 64; 
-    vector<vector<pair<ll, int>>> buckets;
-    vector<ll> bucket_mins;
-    ll global_min;
+vector<ll> duan_sssp_exact_implementation(int source) {
+    int original_n = n;
     
-    RadixHeap() : buckets(BUCKET_COUNT), bucket_mins(BUCKET_COUNT, INF), global_min(0) {}
+    exact_degree_reduction();
     
-    bool empty() const {
-        for (int i = 0; i < BUCKET_COUNT; i++) {
-            if (!buckets[i].empty()) return false;
-        }
-        return true;
-    }
+    double log_n = log2(max(2.0, (double)n));
+    k = max(1, (int)floor(pow(log_n, 1.0/3.0)));
+    t = max(1, (int)floor(pow(log_n, 2.0/3.0)));
+    max_level = max(1, (int)ceil(log_n / max(1.0, (double)t)));
     
-    void push(ll distance, int vertex) {
-        if (distance < global_min) return; 
-        
-        int bucket = get_bucket(distance);
-        buckets[bucket].push_back({distance, vertex});
-        bucket_mins[bucket] = min(bucket_mins[bucket], distance);
-    }
-    
-    pair<ll, int> pop() {
-        int bucket = 0;
-        while (bucket < BUCKET_COUNT && buckets[bucket].empty()) {
-            bucket++;
-        }
-        
-        if (bucket == BUCKET_COUNT) {
-            return {INF, -1};
-        }
-        
-        if (bucket == 0 || buckets[bucket].size() == 1) {
-            auto result = buckets[bucket].back();
-            buckets[bucket].pop_back();
-            
-            if (buckets[bucket].empty()) {
-                bucket_mins[bucket] = INF;
-            }
-            
-            global_min = max(global_min, result.first);
-            return result;
-        }
-        
-        redistribute_bucket(bucket);
-        return pop(); 
-    }
-    
-private:
-    int get_bucket(ll distance) const {
-        if (distance == global_min) return 0;
-        ll diff = distance - global_min;
-        return min(BUCKET_COUNT - 1, 63 - __builtin_clzll(diff));
-    }
-    
-    void redistribute_bucket(int bucket) {
-        vector<pair<ll, int>> items = move(buckets[bucket]);
-        buckets[bucket].clear();
-        bucket_mins[bucket] = INF;
-        
-        ll actual_min = INF;
-        for (const auto& [dist, vertex] : items) {
-            actual_min = min(actual_min, dist);
-        }
-        
-        global_min = actual_min;
-        
-        for (const auto& [dist, vertex] : items) {
-            int new_bucket = get_bucket(dist);
-            buckets[new_bucket].push_back({dist, vertex});
-            bucket_mins[new_bucket] = min(bucket_mins[new_bucket], dist);
-        }
-    }
-};
-
-void final_cleanup() {
-    RadixHeap heap;
-    vector<bool> in_heap(n + 1, false);
-    
-    for (int i = 1; i <= n; i++) {
-        if (dist[i] < INF) {
-            heap.push(dist[i], i);
-            in_heap[i] = true;
-        }
-    }
-    
-    while (!heap.empty()) {
-        auto [d, u] = heap.pop();
-        in_heap[u] = false;
-        
-        if (d > dist[u]) continue;
-        
-        for (const Edge& e : adj[u]) {
-            int v = e.to;
-            ll new_dist = d + e.weight;
-            
-            if (new_dist < dist[v]) {
-                dist[v] = new_dist;
-                pred[v] = u;
-                
-                if (!in_heap[v]) {
-                    heap.push(new_dist, v);
-                    in_heap[v] = true;
-                }
-            }
-        }
-    }
-}
-
-vector<ll> fast_sssp(int source) {
-    DegreeTransform transform(n, adj);
-    n = transform.new_n;
-    adj = transform.new_adj;
-    
-    init_params(n);
-    
-    dist.assign(n + 1, INF);
+    db.assign(n + 1, INF);
     pred.assign(n + 1, -1);
-    complete.assign(n + 1, false);
-    
-    dist[source] = 0;
-    complete[source] = true;
+    db[source] = 0;
     
     vector<int> initial = {source};
-    solve_recursive(lmax, INF, initial);
-    
-    final_cleanup();
+    auto [bound, vertices] = bounded_mssp_paper_spec(max_level, INF, initial);
     
     vector<ll> result;
-    for (int i = 1; i <= transform.original_n; i++) {
-        result.push_back(dist[i]);
+    for (int i = 1; i <= original_n; i++) {
+        result.push_back(db[i]);
     }
-    
     return result;
 }
 
@@ -698,13 +680,13 @@ int main() {
     adj.resize(n + 1);
     
     for (int i = 0; i < m; i++) {
-        int a, b;
-        ll c;
-        cin >> a >> b >> c;
-        adj[a].push_back({b, c});
+        int u, v;
+        ll w;
+        cin >> u >> v >> w;
+        adj[u].push_back({v, w});
     }
     
-    vector<ll> distances = fast_sssp(1);
+    vector<ll> distances = duan_sssp_exact_implementation(1);
     
     for (size_t i = 0; i < distances.size(); i++) {
         cout << distances[i];
@@ -713,5 +695,4 @@ int main() {
     cout << "\n";
     
     return 0;
-
 }
